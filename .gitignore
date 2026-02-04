@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+# ... existing Python ignores omitted for brevity ...
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Data folders
+data/input/
+data/output/
+*.xlsx
+*.png
+
+# Environment variables
+.env

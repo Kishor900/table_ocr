@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Table OCR Grid Converter</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        .container {
+            margin-top: 30px;
+        }
+
+        .image-container {
+            position: relative;
+            display: inline-block;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            overflow: hidden;
+            background: white;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+
+        #sourceImage {
+            max-width: 100%;
+            display: block;
+        }
+
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            margin-bottom: 20px;
+        }
+
+        .card {
+            border: none;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .header-title {
+            color: #2c3e50;
+            font-weight: 700;
+            margin-bottom: 20px;
+        }
+
+        .slider-label {
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container pb-5">
+        <h1 class="text-center header-title">Table OCR Grid Converter</h1>
+
+        <div class="row">
+            <div class="col-md-4">
+                <div class="controls">
+                    <h5 class="mb-3">Upload Image</h5>
+                    <div class="mb-3">
+                        <input class="form-control" type="file" id="imageInput" accept="image/*">
+                    </div>
+                    <button id="uploadBtn" class="btn btn-success w-100 mb-3">Upload & Process</button>
+                    <hr>
+                    <h5 class="mb-3">Settings</h5>
+                    <div class="mb-4">
+                        <label for="thresholdSlider" class="form-label slider-label">
+                            Merge Threshold (px)
+                            <span id="thresholdValue">10</span>
+                        </label>
+                        <input type="range" class="form-range" id="thresholdSlider" min="0" max="50" value="10">
+                        <p class="text-muted small">Adjust to merge fragmented words into single cells.</p>
+                    </div>
+                    <button id="reprocessBtn" class="btn btn-primary w-100">Reprocess Current</button>
+                    <hr>
+                    <div id="status" class="alert alert-info py-2 small">Upload an image. Hover to preview anchor, click
+                        to select!</div>
+
+                    <div id="exportSection" class="mt-4" style="display:none;">
+                        <button id="exportBtn" class="btn btn-warning btn-lg w-100 mb-2">
+                            Export to Excel
+                        </button>
+                        <div class="progress" style="height: 25px; display:none;" id="progressContainer">
+                            <div id="progressBar"
+                                class="progress-bar progress-bar-striped progress-bar-animated bg-success"
+                                role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0"
+                                aria-valuemax="100">0%</div>
+                        </div>
+                        <div id="mappedDownload" class="mt-2 text-center" style="display:none;">
+                            <a href="#" class="btn btn-success w-100">Download Smart-Mapped Excel</a>
+                        </div>
+                        <div id="rawDownload" class="mt-2 text-center" style="display:none;">
+                            <a href="#" class="btn btn-outline-info w-100 mt-2">Download Raw AI Output</a>
+                        </div>
+                        <div id="visionDownload" class="mt-2 text-center" style="display:none;">
+                            <a href="#" class="btn btn-outline-secondary w-100 mt-2">Download Vision-Mapped OCR</a>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card p-3 mb-3">
+                    <h6>Statistics</h6>
+                    <div id="stats" class="text-muted small">
+                        Rows: <span id="rowCount">-</span><br>
+                        Columns: <span id="colCount">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-8">
+                <div class="image-container" id="canvasWrapper">
+                    <img id="sourceImage" src="/image/BankStatementChequing.png" alt="Bank Statement">
+                    <canvas id="overlayCanvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const imageInput = document.getElementById('imageInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const slider = document.getElementById('thresholdSlider');
+        const thresholdValue = document.getElementById('thresholdValue');
+        const reprocessBtn = document.getElementById('reprocessBtn');
+        const exportSection = document.getElementById('exportSection');
+        const exportBtn = document.getElementById('exportBtn');
+        const progressBar = document.getElementById('progressBar');
+        const progressContainer = document.getElementById('progressContainer');
+        const mappedDownloadLink = document.getElementById('mappedDownload');
+        const rawDownloadLink = document.getElementById('rawDownload');
+        const visionDownloadLink = document.getElementById('visionDownload');
+        const status = document.getElementById('status');
+        const img = document.getElementById('sourceImage');
+        const canvas = document.getElementById('overlayCanvas');
+        const ctx = canvas.getContext('2d');
+        const rowCount = document.getElementById('rowCount');
+        const colCount = document.getElementById('colCount');
+
+        let lastData = null;
+        let currentFilename = 'BankStatementChequing.png';
+        let manualAnchor = null;
+        let endAnchor = null;
+        let hoveredWord = null;
+
+        slider.oninput = function () {
+            thresholdValue.textContent = this.value;
+        };
+
+        slider.onchange = function () {
+            if (currentFilename) process();
+        };
+
+        reprocessBtn.onclick = () => {
+            manualAnchor = null;
+            endAnchor = null;
+            if (currentFilename) process();
+        };
+
+        // Manual Anchor Selection Logic
+        canvas.style.pointerEvents = 'auto'; // Enable pointer events for selection
+
+        canvas.onmousemove = function (e) {
+            if (!lastData || !lastData.words) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = (e.clientX - rect.left) * (lastData.image_width / canvas.width);
+            const mouseY = (e.clientY - rect.top) * (lastData.image_height / canvas.height);
+
+            // Find word under mouse
+            let found = null;
+            for (const w of lastData.words) {
+                if (mouseX >= w.x && mouseX <= w.x + w.w && mouseY >= w.y && mouseY <= w.y + w.h) {
+                    found = w;
+                    break;
+                }
+            }
+
+            if (found !== hoveredWord) {
+                hoveredWord = found;
+                drawGrid(lastData);
+            }
+        };
+
+        canvas.onclick = function (e) {
+            if (!hoveredWord) return;
+
+            if (!manualAnchor) {
+                // First click sets the start anchor
+                manualAnchor = {
+                    x: hoveredWord.x + hoveredWord.w / 2,
+                    y: hoveredWord.y + hoveredWord.h / 2
+                };
+            } else if (!endAnchor) {
+                // Second click sets the end anchor
+                endAnchor = {
+                    x: hoveredWord.x + hoveredWord.w / 2,
+                    y: hoveredWord.y + hoveredWord.h / 2
+                };
+            } else {
+                // Third click resets and starts over
+                manualAnchor = {
+                    x: hoveredWord.x + hoveredWord.w / 2,
+                    y: hoveredWord.y + hoveredWord.h / 2
+                };
+                endAnchor = null;
+            }
+            process();
+        };
+
+        uploadBtn.onclick = async function () {
+            manualAnchor = null; // Reset for new upload
+            endAnchor = null;
+            const file = imageInput.files[0];
+            if (!file) {
+                alert("Please select a file first.");
+                return;
+            }
+
+            status.textContent = "Uploading...";
+            status.className = "alert alert-info py-2 small";
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.error) throw new Error(data.error);
+
+                currentFilename = data.filename;
+                img.src = `/image/${currentFilename}`;
+                // process() will be called by img.onload
+            } catch (err) {
+                status.textContent = "Upload Error: " + err.message;
+                status.className = "alert alert-danger py-2 small";
+            }
+        };
+
+        img.onload = function () {
+            canvas.width = img.clientWidth;
+            canvas.height = img.clientHeight;
+            process();
+        };
+
+        async function process() {
+            status.textContent = "Processing...";
+            status.className = "alert alert-info py-2 small";
+
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filename: currentFilename,
+                        threshold: slider.value,
+                        manual_anchor: manualAnchor,
+                        end_anchor: endAnchor
+                    })
+                });
+
+                const data = await response.json();
+                if (data.error) throw new Error(data.error);
+
+                lastData = data;
+                drawGrid(data);
+
+                rowCount.textContent = data.merged_rows.length;
+                colCount.textContent = data.col_lines.length;
+
+                if (data.status === 'awaiting_start_anchor') {
+                    status.textContent = "Click on the START cell (Top-Left) of the table.";
+                    exportSection.style.display = 'none';
+                } else if (!endAnchor) {
+                    status.textContent = "Start anchor set. Now click on the END cell (Bottom-Right) of the table.";
+                    exportSection.style.display = 'none';
+                } else {
+                    status.textContent = "Grid generated for selected range.";
+                    exportSection.style.display = 'block';
+                    downloadLinkContainer.style.display = 'none';
+                    progressContainer.style.display = 'none';
+                }
+                status.className = "alert alert-success py-2 small";
+            } catch (err) {
+                status.textContent = "Error: " + err.message;
+                status.className = "alert alert-danger py-2 small";
+            }
+        }
+
+        exportBtn.onclick = function () {
+            if (!lastData || !manualAnchor || !endAnchor) return;
+
+            exportBtn.disabled = true;
+            progressContainer.style.setProperty('display', 'flex', 'important');
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+
+            mappedDownloadLink.style.display = 'none';
+            rawDownloadLink.style.display = 'none';
+            visionDownloadLink.style.display = 'none';
+
+            status.textContent = "Initializing Export...";
+            status.className = "text-primary fw-bold small mb-2";
+
+            fetch('/export', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    filename: currentFilename,
+                    threshold: slider.value,
+                    manual_anchor: manualAnchor,
+                    end_anchor: endAnchor,
+                    col_lines: lastData.col_lines,
+                    row_lines: lastData.row_lines,
+                    table_left: lastData.table_left
+                })
+            }).then(response => {
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                function read() {
+                    reader.read().then(({ done, value }) => {
+                        if (done) return;
+
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n\n');
+                        buffer = lines.pop(); // Keep the last partial chunk
+
+                        lines.forEach(line => {
+                            if (line.trim().startsWith('data: ')) {
+                                try {
+                                    const jsonStr = line.replace('data: ', '').trim();
+                                    const data = JSON.parse(jsonStr);
+
+                                    if (data.progress !== undefined) {
+                                        const p = Math.round(data.progress);
+                                        progressBar.style.width = p + '%';
+                                        progressBar.textContent = p + '%';
+                                        if (data.status_msg) {
+                                            status.textContent = `${data.status_msg}: ${p}%`;
+                                        } else {
+                                            status.textContent = `Processing: ${p}%`;
+                                        }
+                                    }
+
+                                    if (data.complete) {
+                                        status.textContent = "Export Complete!";
+                                        exportBtn.disabled = false;
+
+                                        mappedDownloadLink.style.display = 'block';
+                                        const aMapped = mappedDownloadLink.querySelector('a');
+                                        aMapped.href = data.mapped_url;
+
+                                        rawDownloadLink.style.display = 'block';
+                                        const aRaw = rawDownloadLink.querySelector('a');
+                                        aRaw.href = data.raw_url;
+
+                                        visionDownloadLink.style.display = 'block';
+                                        const aVision = visionDownloadLink.querySelector('a');
+                                        aVision.href = data.vision_url;
+
+                                        progressContainer.style.display = 'none';
+                                    }
+
+                                    if (data.error) {
+                                        status.textContent = "Export Error: " + data.error;
+                                        status.className = "alert alert-danger py-2 small";
+                                        exportBtn.disabled = false;
+                                        progressContainer.style.display = 'none';
+                                    }
+                                } catch (e) {
+                                    console.error("Error parsing SSE line:", e, line);
+                                }
+                            }
+                        });
+                        read();
+                    });
+                }
+                read();
+            }).catch(err => {
+                status.textContent = "Network Error: " + err.message;
+                status.className = "alert alert-danger py-2 small";
+                exportBtn.disabled = false;
+                progressContainer.style.display = 'none';
+            });
+        };
+
+        function drawGrid(data) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const scaleX = canvas.width / data.image_width;
+            const scaleY = canvas.height / data.image_height;
+
+            // Draw all detected words faintly when awaiting anchor
+            if (data.status === 'awaiting_anchor' || hoveredWord) {
+                ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
+                ctx.lineWidth = 1;
+                data.words.forEach(w => {
+                    ctx.strokeRect(w.x * scaleX, w.y * scaleY, w.w * scaleX, w.h * scaleY);
+                });
+            }
+
+            if (data.status === 'processed') {
+                // Draw Table Grid
+                ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.lineWidth = 1;
+
+                // Horizontal Lines (using row_lines)
+                // Also draw the top line of the table (anchor row's top)
+                const tableLeft = data.table_left * scaleX;
+                const tableTop = data.anchor.y * scaleY;
+                ctx.beginPath();
+                ctx.moveTo(tableLeft, tableTop);
+                // Last vertical line X coordinate
+                const tableRight = data.col_lines[data.col_lines.length - 1] * scaleX;
+                ctx.lineTo(tableRight, tableTop);
+                ctx.stroke();
+
+                data.row_lines.forEach(lineY => {
+                    const y = lineY * scaleY;
+                    ctx.beginPath();
+                    ctx.moveTo(tableLeft, y);
+                    ctx.lineTo(tableRight, y);
+                    ctx.stroke();
+                });
+
+                // Vertical Lines (using col_lines and robust table_left)
+                // Leftmost line
+                const tableBottom = data.row_lines[data.row_lines.length - 1] * scaleY;
+                ctx.beginPath();
+                ctx.moveTo(tableLeft, tableTop);
+                ctx.lineTo(tableLeft, tableBottom);
+                ctx.stroke();
+
+                data.col_lines.forEach(lineX => {
+                    const x = lineX * scaleX;
+                    ctx.beginPath();
+                    ctx.moveTo(x, tableTop);
+                    ctx.lineTo(x, tableBottom);
+                    ctx.stroke();
+                });
+            }
+
+            // Draw selection indicators
+            if (manualAnchor) {
+                ctx.strokeStyle = '#0f0';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([2, 2]);
+                ctx.strokeRect(data.anchor.x * scaleX, data.anchor.y * scaleY, data.anchor.w * scaleX, data.anchor.h * scaleY);
+            }
+            if (data.status === 'processed' && data.end_anchor) {
+                ctx.strokeStyle = '#f00';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([2, 2]);
+                ctx.strokeRect(data.end_anchor.x * scaleX, data.anchor.y * scaleY, data.end_anchor.w * scaleX, data.end_anchor.h * scaleY);
+            }
+            ctx.setLineDash([]);
+
+            // Draw Hover Highlight
+            if (hoveredWord) {
+                ctx.strokeStyle = 'rgba(255, 255, 0, 0.8)';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(hoveredWord.x * scaleX, hoveredWord.y * scaleY, hoveredWord.w * scaleX, hoveredWord.h * scaleY);
+
+                // Tooltip text
+                ctx.fillStyle = '#ff0';
+                ctx.font = 'bold 12px Arial';
+                ctx.fillText(hoveredWord.text, hoveredWord.x * scaleX, (hoveredWord.y * scaleY) - 5);
+            }
+        }
+
+        window.onresize = () => {
+            canvas.width = img.clientWidth;
+            canvas.height = img.clientHeight;
+            if (lastData) drawGrid(lastData);
+        };
+    </script>
+</body>
+
+</html>
