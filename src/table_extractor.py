@@ -10,7 +10,7 @@ from PIL import Image
 from google.cloud import vision
 
 class TableExtractor:
-    def __init__(self, key_path=r"D:\ROBOTICS\allocr\key.json", ocr_model='qwen3-vl:8b-instruct'):
+    def __init__(self, key_path=r"d:\table_ocr\key.json", ocr_model='qwen3-vl:8b-instruct'):
         self.ocr_model = ocr_model
         # Initialize Google Cloud Vision Client
         if os.path.exists(key_path):
@@ -45,10 +45,15 @@ class TableExtractor:
             # Get bounding box
             vertices = anno.bounding_poly.vertices
             # Vertices are: top-left, top-right, bottom-right, bottom-left
-            x = min(v.x for v in vertices)
-            y = min(v.y for v in vertices)
-            w = max(v.x for v in vertices) - x
-            h = max(v.y for v in vertices) - y
+            # Handle potential empty vertices or missing coordinates
+            vx = [v.x if v.x else 0 for v in vertices]
+            vy = [v.y if v.y else 0 for v in vertices]
+            if not vx or not vy: continue
+            
+            x = min(vx)
+            y = min(vy)
+            w = max(vx) - x
+            h = max(vy) - y
             
             words.append({
                 'text': anno.description.strip(),
@@ -56,7 +61,7 @@ class TableExtractor:
                 'y': y,
                 'w': w,
                 'h': h,
-                'conf': 100  # Vision doesn't provide confidence per word in text_detection easily
+                'conf': 100
             })
 
         # Get image dimensions
@@ -156,7 +161,7 @@ class TableExtractor:
             table_words = [w for w in words if w['y'] >= anchor['y'] - margin and w['x'] >= anchor['x'] - 100]
         
         if not table_words:
-            return [], []
+            return [], [], [], anchor['x'], None
 
         # 1. Row Detection (Grouping by vertical proximity)
         table_words.sort(key=lambda w: w['y'])
@@ -165,8 +170,6 @@ class TableExtractor:
             current_row = [table_words[0]]
             for i in range(1, len(table_words)):
                 w = table_words[i]
-                # If word overlaps vertically with current row or is very close
-                # We use a threshold based on average height
                 if w['y'] < current_row[-1]['y'] + current_row[-1]['h'] * 0.7:
                     current_row.append(w)
                 else:
@@ -174,7 +177,7 @@ class TableExtractor:
                     current_row = [w]
             rows.append(current_row)
 
-        # 2. Merging blocks within rows (as before but more aware)
+        # 2. Merging blocks within rows
         final_merged_rows = []
         for row in rows:
             row.sort(key=lambda w: w['x'])
@@ -183,7 +186,9 @@ class TableExtractor:
                 curr = row[0].copy()
                 for i in range(1, len(row)):
                     nxt = row[i]
-                    if nxt['x'] - (curr['x'] + curr['w']) <= threshold_px:
+                    # INCREASED DISTANCE: 12px instead of threshold_px (5px)
+                    # This prevents splitting long descriptions/phases
+                    if nxt['x'] - (curr['x'] + curr['w']) <= 12:
                         curr['text'] += " " + nxt['text']
                         curr['w'] = max(curr['x'] + curr['w'], nxt['x'] + nxt['w']) - curr['x']
                         curr['h'] = max(curr['h'], nxt['h'])
@@ -193,10 +198,50 @@ class TableExtractor:
                 merged.append(curr)
                 final_merged_rows.append(merged)
 
-        # 3. Column Estimation (Transitive Merging)
+        # 3. Auto-detect table end if no end_anchor provided
+        # We look for "grid symmetry" break.
+        if not end_anchor and len(final_merged_rows) > 3:
+            # Analyze first 2-3 rows to get a sense of column structure
+            # Header row + first few data rows
+            structure_rows = final_merged_rows[:3]
+            num_ref_cols = len(structure_rows[0])
+            
+            # Find a break point
+            break_idx = len(final_merged_rows)
+            for i in range(1, len(final_merged_rows)):
+                curr_row = final_merged_rows[i]
+                
+                # Simple check: if column count drops significantly or structure changes
+                # Also check vertical gap
+                if i > 0:
+                    prev_row_bottom = max(b['y'] + b['h'] for b in final_merged_rows[i-1])
+                    curr_row_top = min(b['y'] for b in curr_row)
+                    # Average height of previous row
+                    avg_h = sum(b['h'] for b in final_merged_rows[i-1]) / len(final_merged_rows[i-1])
+                    
+                    # Increased tolerance for gaps (3.5x height instead of 2.5x)
+                    # This helps with sparse data or section headers
+                    if curr_row_top - prev_row_bottom > avg_h * 3.5:
+                        break_idx = i
+                        break
+                
+                # Check column alignment against headers if available
+                # If the row has 1 column and it's very wide, it might be a footer
+                if len(curr_row) == 1 and curr_row[0]['w'] > (anchor['w'] * 3):
+                    # Check if it aligns with the first column or spans multiple
+                    if i > 1: # Give it some slack
+                        break_idx = i
+                        break
+            
+            final_merged_rows = final_merged_rows[:break_idx]
+            # Proposed end anchor is the last word of the last row
+            if final_merged_rows:
+                end_anchor = final_merged_rows[-1][-1]
+
+        # 4. Column Estimation (Transitive Merging)
         all_blocks = [b for row in final_merged_rows for b in row]
         if not all_blocks:
-            return [], [], [], anchor['x']
+            return [], [], [], anchor['x'], end_anchor
 
         # Start with each block in its own column
         columns = [[b] for b in all_blocks]
@@ -228,8 +273,9 @@ class TableExtractor:
                     # Overlap or proximity check
                     overlap = min(current_x_end, target_x_end) - max(current_x_start, target_x_start)
                     
-                    # We merge if there is ANY overlap OR if they are within 4px (Tightened from 10px)
-                    if overlap > 0 or abs(current_x_end - target_x_start) < 4 or abs(target_x_end - current_x_start) < 4:
+                    # INCREASED DISTANCE: 10px instead of 4px
+                    # Helps unify columns that might be slightly misaligned or fragmented
+                    if overlap > 0 or abs(current_x_end - target_x_start) < 10 or abs(target_x_end - current_x_start) < 10:
                         # Before merging, check if this merge is "transitive" via any individual block
                         # i.e., Does any block in the entire table bridge these two columns?
                         # For simplicity, we merge if their bounds overlap/touch.
@@ -266,8 +312,9 @@ class TableExtractor:
         if columns:
             table_left = min(c['x'] for c in columns[0])
             for col in columns:
+                # ENSURE RIGHTMOST EDGE: Always take the maximum x+w in the column
                 max_right = max(c['x'] + c['w'] for c in col)
-                if col_lines and (max_right - col_lines[-1]) < 5: # Tightened from 10px to 5px
+                if col_lines and (max_right - col_lines[-1]) < 8: # Balanced tolerance
                     col_lines[-1] = max_right
                 else:
                     col_lines.append(max_right)
@@ -278,7 +325,7 @@ class TableExtractor:
             avg_bottom = sum(b['y'] + b['h'] for b in row) / len(row)
             row_lines.append(avg_bottom)
 
-        return col_lines, row_lines, final_merged_rows, table_left
+        return col_lines, row_lines, final_merged_rows, table_left, end_anchor
 
     def map_words_to_grid(self, words, col_lines, row_lines, table_left, table_top):
         """
@@ -311,7 +358,95 @@ class TableExtractor:
         
         return grid
 
-    def extract_cell_data(self, image_path, anchor, col_lines, row_lines, table_left, headers=None):
+    def auto_detect_table(self, words, threshold_px=5):
+        """
+        Scan all words to find the most probable table structure.
+        """
+        if not words:
+            return None, None
+
+        # Filter words that look like headers (at least 3 words in a row)
+        # Sort words by y
+        sorted_words = sorted(words, key=lambda w: w['y'])
+        
+        candidates = []
+        i = 0
+        while i < len(sorted_words):
+            current_y = sorted_words[i]['y']
+            h = sorted_words[i]['h']
+            # Find all words in this same horizontal band
+            row = [sorted_words[i]]
+            j = i + 1
+            while j < len(sorted_words) and sorted_words[j]['y'] < current_y + h * 0.5:
+                row.append(sorted_words[j])
+                j += 1
+            
+            if len(row) >= 3: # Potential header row
+                # Sort row by x
+                row.sort(key=lambda w: w['x'])
+                # Candidate start anchor is the first word of this row
+                candidates.append(row[0])
+            
+            i = j
+
+        best_score = -1
+        best_anchors = (None, None)
+
+        # Evaluate each candidate anchor
+        # Increased limit from 15 to 50 to ensure we scan the whole document
+        # Even if there are many lines of text
+        for anchor in candidates[:50]: 
+            col_lines, row_lines, merged_rows, table_left, end_anchor = self.get_robust_grid(words, anchor, threshold_px=threshold_px)
+            
+            if not merged_rows: continue
+            
+            # Scoring logic:
+            # We want to favor tables with many rows AND many columns (area)
+            num_rows = len(merged_rows)
+            num_cols = len(col_lines)
+            
+            if num_rows < 2 or num_cols < 2: continue
+            
+            # Give extra weight to rows, as long tables are usually the "main" table
+            # score = area * some_density_bonus
+            score = (num_rows ** 1.2) * num_cols 
+            
+            if score > best_score:
+                best_score = score
+                best_anchors = (anchor, end_anchor)
+        
+        return best_anchors
+
+    def group_extra_cells(self, extra_cells):
+        if not extra_cells:
+            return []
+        
+        # Sort by Y first to group into rows
+        # We use a copy to avoid modifying the original selection order if we ever need it
+        items = sorted(extra_cells, key=lambda x: x['y'])
+        
+        rows = []
+        if items:
+            current_row = [items[0]]
+            for i in range(1, len(items)):
+                ec = items[i]
+                h = ec.get('h', 20) or 20
+                if ec['y'] < current_row[-1]['y'] + h * 0.7:
+                    current_row.append(ec)
+                else:
+                    rows.append(current_row)
+                    current_row = [ec]
+            rows.append(current_row)
+        
+        final_rows = []
+        for row in rows:
+            # Sort words within each row by X position
+            row.sort(key=lambda x: x['x'])
+            final_rows.append([ec['text'] for ec in row])
+        return final_rows
+
+    def extract_cell_data(self, image_path, anchor, col_lines, row_lines, table_left, headers=None, 
+                          include_mapped=True, include_raw=True, include_vision=True, extra_cells=None):
         """
         Perform OCR by processing the entire table area in one shot using Qwen,
         then mapping the results back to the detected grid.
@@ -372,63 +507,99 @@ class TableExtractor:
                     f"Output ONLY the JSON and nothing else."
                 )
             
-            yield 20, TOTAL_STEPS, "Hiring Qwen for extraction", None
-            yield 40, TOTAL_STEPS, "Qwen is reading... (This may take 30-90s)", None
-            
-            response = ollama.chat(
-                model=self.ocr_model,
-                messages=[{'role': 'user', 'content': prompt, 'images': [img_base64]}],
-                options={'temperature': 0}
-            )
-            
-            yield 80, TOTAL_STEPS, "Organizing extracted data", None
-            
-            raw_content = response['message']['content'].strip()
-            import re
-            import json
-            
-            # Robust JSON extraction
-            json_match = re.search(r'\[\s*\{.*\}\s*\]|\[\s*\[.*\]\s*\]', raw_content, re.DOTALL)
-            if json_match:
-                extracted_data = json.loads(json_match.group(0))
+            if include_mapped or include_raw:
+                yield 20, TOTAL_STEPS, "Hiring Qwen for extraction", None
+                yield 40, TOTAL_STEPS, "Qwen is reading... (This may take 30-90s)", None
                 
-                yield 90, TOTAL_STEPS, "Mapping results to grid", None
+                response = ollama.chat(
+                    model=self.ocr_model,
+                    messages=[{'role': 'user', 'content': prompt, 'images': [img_base64]}],
+                    options={'temperature': 0}
+                )
                 
-                if headers and isinstance(extracted_data, list) and len(extracted_data) > 0 and isinstance(extracted_data[0], dict):
-                    # Smart Mapping: Map objects to grid using headers
-                    for r_idx, row_obj in enumerate(extracted_data):
-                        if r_idx < num_rows:
-                            for c_idx, h_name in enumerate(headers):
-                                if h_name in row_obj:
-                                    final_grid[r_idx][c_idx] = str(row_obj[h_name]) if row_obj[h_name] is not None else ""
+                yield 80, TOTAL_STEPS, "Organizing extracted data", None
+                
+                raw_content = response['message']['content'].strip()
+                import re
+                import json
+                
+                # Robust JSON extraction
+                json_match = re.search(r'\[\s*\{.*\}\s*\]|\[\s*\[.*\]\s*\]', raw_content, re.DOTALL)
+                if json_match:
+                    extracted_data = json.loads(json_match.group(0))
+                    
+                    yield 90, TOTAL_STEPS, "Mapping results to grid", None
+                    
+                    if include_mapped:
+                        if headers and isinstance(extracted_data, list) and len(extracted_data) > 0 and isinstance(extracted_data[0], dict):
+                            # Smart Mapping: Map objects to grid using headers
+                            for r_idx, row_obj in enumerate(extracted_data):
+                                if r_idx < num_rows:
+                                    for c_idx, h_name in enumerate(headers):
+                                        if h_name in row_obj:
+                                            final_grid[r_idx][c_idx] = str(row_obj[h_name]) if row_obj[h_name] is not None else ""
+                        else:
+                            # Fallback or List-of-Lists Mapping
+                            for r_idx, row in enumerate(extracted_data):
+                                if r_idx < num_rows:
+                                    if isinstance(row, list):
+                                        for c_idx, val in enumerate(row):
+                                            if c_idx < num_cols:
+                                                final_grid[r_idx][c_idx] = str(val) if val is not None else ""
+                                    elif isinstance(row, dict):
+                                        # Unusual case: list of objects but no headers provided? Try matching keys
+                                        for c_idx, val in enumerate(row.values()):
+                                            if c_idx < num_cols:
+                                                final_grid[r_idx][c_idx] = str(val) if val is not None else ""
                 else:
-                    # Fallback or List-of-Lists Mapping
-                    for r_idx, row in enumerate(extracted_data):
-                        if r_idx < num_rows:
-                            if isinstance(row, list):
-                                for c_idx, val in enumerate(row):
-                                    if c_idx < num_cols:
-                                        final_grid[r_idx][c_idx] = str(val) if val is not None else ""
-                            elif isinstance(row, dict):
-                                # Unusual case: list of objects but no headers provided? Try matching keys
-                                for c_idx, val in enumerate(row.values()):
-                                    if c_idx < num_cols:
-                                        final_grid[r_idx][c_idx] = str(val) if val is not None else ""
+                    raise ValueError(f"Could not parse Qwen response as JSON. Raw response: {raw_content[:200]}...")
+            else:
+                extracted_data = None
+            
+            # Prepend extra cells to extracted_data (raw) and final_grid (mapped)
+            if extra_cells:
+                extra_meta_rows = self.group_extra_cells(extra_cells)
                 
-                
+                # For raw data (list of objects or list of lists)
+                if include_raw and extracted_data is not None:
+                    if headers and isinstance(extracted_data, list) and len(extracted_data) > 0 and isinstance(extracted_data[0], dict):
+                        # Convert meta rows to objects using headers
+                        extra_rows_raw = []
+                        for mr in extra_meta_rows:
+                            row_obj = {h: mr[i] if i < len(mr) else "" for i, h in enumerate(headers)}
+                            extra_rows_raw.append(row_obj)
+                        extracted_data = extra_rows_raw + extracted_data
+                    else:
+                        extracted_data = extra_meta_rows + extracted_data
+
+                # For mapped grid
+                if include_mapped:
+                    final_grid = extra_meta_rows + final_grid
+
+            vision_grid = None
+            if include_vision:
                 # Vision-Mapped Export (Geometric only)
                 # Get words for spatial mapping
                 words, _ = self.get_words(image_path)
-                vision_grid = self.map_words_to_grid(words, col_lines, row_lines, table_left, anchor['y'])
+                full_vision_grid = self.map_words_to_grid(words, col_lines, row_lines, table_left, anchor['y'])
                 
-                yield 100, TOTAL_STEPS, "Complete", {
-                    "mapped": final_grid, 
-                    "raw": extracted_data,
-                    "vision": vision_grid
-                }
-                return
-            else:
-                raise ValueError(f"Could not parse Qwen response as JSON. Raw response: {raw_content[:200]}...")
+                # If we have headers, the first row of full_vision_grid is the header. 
+                # We skip it in the data to avoid duplication in Excel.
+                if headers and len(full_vision_grid) > 0:
+                    vision_grid = full_vision_grid[1:]
+                else:
+                    vision_grid = full_vision_grid
+                
+                if extra_cells:
+                    extra_meta_rows = self.group_extra_cells(extra_cells)
+                    vision_grid = extra_meta_rows + vision_grid
+            
+            yield 100, TOTAL_STEPS, "Complete", {
+                "mapped": final_grid if include_mapped else None, 
+                "raw": extracted_data if include_raw else None,
+                "vision": vision_grid if include_vision else None
+            }
+            return
 
         except Exception as e:
             print(f"One-shot extraction failed: {e}")

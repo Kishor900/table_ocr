@@ -78,15 +78,41 @@
                     <button id="uploadBtn" class="btn btn-success w-100 mb-3">Upload & Process</button>
                     <hr>
                     <h5 class="mb-3">Settings</h5>
+                    <div class="mb-3">
+                        <label class="form-label slider-label mb-2">Extraction Methods</label>
+                        <div class="form-check mb-1">
+                            <input class="form-check-input" type="checkbox" id="checkMapped" checked>
+                            <label class="form-check-label small" for="checkMapped">
+                                Smart-Mapped <span class="badge bg-secondary">AI Required</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-1">
+                            <input class="form-check-input" type="checkbox" id="checkRaw">
+                            <label class="form-check-label small" for="checkRaw">
+                                Raw AI Output <span class="badge bg-secondary">AI Required</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="checkVision" checked>
+                            <label class="form-check-label small" for="checkVision">
+                                Vision-Mapped <span class="badge bg-primary">Local/Fast</span>
+                            </label>
+                        </div>
+                    </div>
                     <div class="mb-4">
                         <label for="thresholdSlider" class="form-label slider-label">
                             Merge Threshold (px)
                             <span id="thresholdValue">10</span>
                         </label>
                         <input type="range" class="form-range" id="thresholdSlider" min="0" max="50" value="10">
-                        <p class="text-muted small">Adjust to merge fragmented words into single cells.</p>
                     </div>
-                    <button id="reprocessBtn" class="btn btn-primary w-100">Reprocess Current</button>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="checkSelectMore">
+                        <label class="form-check-label fw-bold text-primary" for="checkSelectMore">
+                            Select/Add more cells
+                        </label>
+                    </div>
+                    <button id="reprocessBtn" class="btn btn-outline-primary w-100">Reset Anchors / Reprocess</button>
                     <hr>
                     <div id="status" class="alert alert-info py-2 small">Upload an image. Hover to preview anchor, click
                         to select!</div>
@@ -144,6 +170,10 @@
         const mappedDownloadLink = document.getElementById('mappedDownload');
         const rawDownloadLink = document.getElementById('rawDownload');
         const visionDownloadLink = document.getElementById('visionDownload');
+        const checkMapped = document.getElementById('checkMapped');
+        const checkRaw = document.getElementById('checkRaw');
+        const checkVision = document.getElementById('checkVision');
+        const checkSelectMore = document.getElementById('checkSelectMore');
         const status = document.getElementById('status');
         const img = document.getElementById('sourceImage');
         const canvas = document.getElementById('overlayCanvas');
@@ -156,6 +186,7 @@
         let manualAnchor = null;
         let endAnchor = null;
         let hoveredWord = null;
+        let extraCells = [];
 
         slider.oninput = function () {
             thresholdValue.textContent = this.value;
@@ -168,6 +199,7 @@
         reprocessBtn.onclick = () => {
             manualAnchor = null;
             endAnchor = null;
+            extraCells = [];
             if (currentFilename) process();
         };
 
@@ -199,6 +231,18 @@
         canvas.onclick = function (e) {
             if (!hoveredWord) return;
 
+            if (checkSelectMore.checked) {
+                // Toggle word in extraCells
+                const index = extraCells.findIndex(w => w.x === hoveredWord.x && w.y === hoveredWord.y && w.text === hoveredWord.text);
+                if (index > -1) {
+                    extraCells.splice(index, 1);
+                } else {
+                    extraCells.push(hoveredWord);
+                }
+                drawGrid(lastData);
+                return;
+            }
+
             if (!manualAnchor) {
                 // First click sets the start anchor
                 manualAnchor = {
@@ -218,6 +262,7 @@
                     y: hoveredWord.y + hoveredWord.h / 2
                 };
                 endAnchor = null;
+                extraCells = []; // Maybe keep them? User said "after completely drawn", so maybe reset is fine.
             }
             process();
         };
@@ -247,7 +292,8 @@
 
                 currentFilename = data.filename;
                 img.src = `/image/${currentFilename}`;
-                // process() will be called by img.onload
+                // process() will be called by img.onload if we keep the existing logic,
+                // or we can explicitly call it here after a short delay/load.
             } catch (err) {
                 status.textContent = "Upload Error: " + err.message;
                 status.className = "alert alert-danger py-2 small";
@@ -282,20 +328,31 @@
                 lastData = data;
                 drawGrid(data);
 
-                rowCount.textContent = data.merged_rows.length;
-                colCount.textContent = data.col_lines.length;
-
                 if (data.status === 'awaiting_start_anchor') {
                     status.textContent = "Click on the START cell (Top-Left) of the table.";
                     exportSection.style.display = 'none';
-                } else if (!endAnchor) {
+                } else if (!endAnchor && !data.is_auto_end) {
                     status.textContent = "Start anchor set. Now click on the END cell (Bottom-Right) of the table.";
                     exportSection.style.display = 'none';
                 } else {
-                    status.textContent = "Grid generated for selected range.";
+                    if (data.is_auto_end) {
+                        status.textContent = "Table auto-detected! You can export now, or click an END cell to override.";
+                        // Store the auto-detected end anchor internally but don't finalize it yet
+                        // so the user can still click a manual one.
+                        // Actually, let's keep endAnchor null so the next click works as an manual override.
+                    } else {
+                        status.textContent = "Grid generated for selected range.";
+                    }
+
                     exportSection.style.display = 'block';
-                    downloadLinkContainer.style.display = 'none';
-                    progressContainer.style.display = 'none';
+
+                    rowCount.textContent = data.merged_rows.length;
+                    colCount.textContent = data.col_lines.length;
+
+                    mappedDownloadLink.style.display = 'none';
+                    rawDownloadLink.style.display = 'none';
+                    visionDownloadLink.style.display = 'none';
+                    progressContainer.style.setProperty('display', 'none', 'important');
                 }
                 status.className = "alert alert-success py-2 small";
             } catch (err) {
@@ -305,7 +362,8 @@
         }
 
         exportBtn.onclick = function () {
-            if (!lastData || !manualAnchor || !endAnchor) return;
+            const finalEndAnchor = endAnchor || (lastData ? lastData.end_anchor : null);
+            if (!lastData || !manualAnchor || !finalEndAnchor) return;
 
             exportBtn.disabled = true;
             progressContainer.style.setProperty('display', 'flex', 'important');
@@ -326,10 +384,14 @@
                     filename: currentFilename,
                     threshold: slider.value,
                     manual_anchor: manualAnchor,
-                    end_anchor: endAnchor,
+                    end_anchor: finalEndAnchor,
                     col_lines: lastData.col_lines,
                     row_lines: lastData.row_lines,
-                    table_left: lastData.table_left
+                    table_left: lastData.table_left,
+                    include_mapped: checkMapped.checked,
+                    include_raw: checkRaw.checked,
+                    include_vision: checkVision.checked,
+                    extra_cells: extraCells
                 })
             }).then(response => {
                 const reader = response.body.getReader();
@@ -363,19 +425,21 @@
 
                                     if (data.complete) {
                                         status.textContent = "Export Complete!";
+                                        status.className = "alert alert-success py-2 small";
                                         exportBtn.disabled = false;
 
-                                        mappedDownloadLink.style.display = 'block';
-                                        const aMapped = mappedDownloadLink.querySelector('a');
-                                        aMapped.href = data.mapped_url;
-
-                                        rawDownloadLink.style.display = 'block';
-                                        const aRaw = rawDownloadLink.querySelector('a');
-                                        aRaw.href = data.raw_url;
-
-                                        visionDownloadLink.style.display = 'block';
-                                        const aVision = visionDownloadLink.querySelector('a');
-                                        aVision.href = data.vision_url;
+                                        if (data.mapped_url) {
+                                            mappedDownloadLink.style.display = 'block';
+                                            mappedDownloadLink.querySelector('a').href = data.mapped_url;
+                                        }
+                                        if (data.raw_url) {
+                                            rawDownloadLink.style.display = 'block';
+                                            rawDownloadLink.querySelector('a').href = data.raw_url;
+                                        }
+                                        if (data.vision_url) {
+                                            visionDownloadLink.style.display = 'block';
+                                            visionDownloadLink.querySelector('a').href = data.vision_url;
+                                        }
 
                                         progressContainer.style.display = 'none';
                                     }
@@ -473,6 +537,25 @@
                 ctx.strokeRect(data.end_anchor.x * scaleX, data.anchor.y * scaleY, data.end_anchor.w * scaleX, data.end_anchor.h * scaleY);
             }
             ctx.setLineDash([]);
+
+            // Draw extra cells
+            extraCells.forEach((w, i) => {
+                const x = w.x * scaleX;
+                const y = w.y * scaleY;
+                const width = w.w * scaleX;
+                const height = w.h * scaleY;
+
+                ctx.strokeStyle = '#ff8c00'; // Dark Orange
+                ctx.lineWidth = 2;
+                ctx.strokeRect(x, y, width, height);
+
+                // Add a small index badge
+                ctx.fillStyle = '#ff8c00';
+                ctx.fillRect(x - 2, y - 15, 18, 15);
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 10px Arial';
+                ctx.fillText(i + 1, x + 2, y - 4);
+            });
 
             // Draw Hover Highlight
             if (hoveredWord) {

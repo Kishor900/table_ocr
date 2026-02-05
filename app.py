@@ -11,8 +11,9 @@ import time
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'data/input'
 app.config['OUTPUT_FOLDER'] = 'data/output'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
-VISION_KEY_PATH = r"D:\ROBOTICS\allocr\key.json"
+VISION_KEY_PATH = r"d:\table_ocr\key.json"
 extractor = TableExtractor(key_path=VISION_KEY_PATH)
 
 @app.route('/')
@@ -60,6 +61,15 @@ def process_image():
                 if dist < best_dist:
                     best_dist = dist
                     anchor = w
+        else:
+            # Fully automatic detection
+            auto_anchor, auto_end = extractor.auto_detect_table(words, threshold_px=threshold)
+            if auto_anchor:
+                anchor = auto_anchor
+                # If we found an auto_anchor, we also potentially have an auto_end
+                # This will be passed to get_robust_grid below
+                if not end_anchor_input:
+                    end_anchor = auto_end
         
         end_anchor = None
         if end_anchor_input:
@@ -81,12 +91,13 @@ def process_image():
             })
             
         # Use the new robust grid estimation logic with optional end anchor
-        col_lines, row_lines, merged_rows, table_left = extractor.get_robust_grid(words, anchor, end_anchor=end_anchor, threshold_px=threshold)
+        col_lines, row_lines, merged_rows, table_left, auto_end_anchor = extractor.get_robust_grid(words, anchor, end_anchor=end_anchor, threshold_px=threshold)
         
         return jsonify({
             'words': words,
             'anchor': anchor,
-            'end_anchor': end_anchor,
+            'end_anchor': end_anchor or auto_end_anchor,
+            'is_auto_end': end_anchor is None and auto_end_anchor is not None,
             'merged_rows': merged_rows,
             'col_lines': col_lines,
             'row_lines': row_lines,
@@ -108,6 +119,10 @@ def export_table():
     col_lines = data.get('col_lines', [])
     row_lines = data.get('row_lines', [])
     table_left = data.get('table_left')
+    include_mapped = data.get('include_mapped', True)
+    include_raw = data.get('include_raw', True)
+    include_vision = data.get('include_vision', True)
+    extra_cells = data.get('extra_cells', [])
     
     image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     
@@ -150,7 +165,9 @@ def export_table():
 
             # Use the generator for real-time progress
             generator = extractor.extract_cell_data(
-                image_path, anchor_obj, col_lines, row_lines, table_left, headers=headers
+                image_path, anchor_obj, col_lines, row_lines, table_left, headers=headers,
+                include_mapped=include_mapped, include_raw=include_raw, include_vision=include_vision,
+                extra_cells=extra_cells
             )
             
             data_rows = None
@@ -168,35 +185,40 @@ def export_table():
                     data_rows = result
             
             if result and isinstance(result, dict) and 'mapped' in result:
-                # Save Mapped Export
-                df_mapped = pd.DataFrame(result['mapped'])
-                if headers and len(headers) == df_mapped.shape[1]:
-                    df_mapped.columns = headers
-                    header_option = True
-                else:
-                    header_option = False
-
                 ts = int(time.time())
-                mapped_filename = f"mapped_export_{ts}.xlsx"
-                mapped_path = os.path.join(app.config['OUTPUT_FOLDER'], mapped_filename)
-                df_mapped.to_excel(mapped_path, index=False, header=header_option)
+                
+                mapped_filename = None
+                if include_mapped and 'mapped' in result and result['mapped'] is not None:
+                    df_mapped = pd.DataFrame(result['mapped'])
+                    if headers and len(headers) == df_mapped.shape[1]:
+                        df_mapped.columns = headers
+                        header_option = True
+                    else:
+                        header_option = False
+                    mapped_filename = f"mapped_export_{ts}.xlsx"
+                    mapped_path = os.path.join(app.config['OUTPUT_FOLDER'], mapped_filename)
+                    df_mapped.to_excel(mapped_path, index=False, header=header_option)
 
-                # Save Raw AI Export
-                # result['raw'] is a list of dicts (if headers used) or list of lists
-                df_raw = pd.DataFrame(result['raw'])
-                raw_filename = f"raw_ai_export_{ts}.xlsx"
-                raw_path = os.path.join(app.config['OUTPUT_FOLDER'], raw_filename)
-                df_raw.to_excel(raw_path, index=False)
+                raw_filename = None
+                if include_raw and 'raw' in result and result['raw'] is not None:
+                    df_raw = pd.DataFrame(result['raw'])
+                    raw_filename = f"raw_ai_export_{ts}.xlsx"
+                    raw_path = os.path.join(app.config['OUTPUT_FOLDER'], raw_filename)
+                    df_raw.to_excel(raw_path, index=False)
                 
-                # Save Vision-Mapped Export (Geometric OCR)
-                df_vision = pd.DataFrame(result['vision'])
-                if headers and len(headers) == df_vision.shape[1]:
-                    df_vision.columns = headers
-                vision_filename = f"vision_mapped_export_{ts}.xlsx"
-                vision_path = os.path.join(app.config['OUTPUT_FOLDER'], vision_filename)
-                df_vision.to_excel(vision_path, index=False, header=header_option)
+                vision_filename = None
+                if include_vision and 'vision' in result and result['vision'] is not None:
+                    df_vision = pd.DataFrame(result['vision'])
+                    if headers and len(headers) == df_vision.shape[1]:
+                        df_vision.columns = headers
+                        header_option = True
+                    else:
+                        header_option = False
+                    vision_filename = f"vision_mapped_export_{ts}.xlsx"
+                    vision_path = os.path.join(app.config['OUTPUT_FOLDER'], vision_filename)
+                    df_vision.to_excel(vision_path, index=False, header=header_option)
                 
-                yield f"data: {json.dumps({'progress': 100, 'complete': True, 'mapped_url': f'/download/{mapped_filename}', 'raw_url': f'/download/{raw_filename}', 'vision_url': f'/download/{vision_filename}'})}\n\n"
+                yield f"data: {json.dumps({'progress': 100, 'complete': True, 'mapped_url': f'/download/{mapped_filename}' if mapped_filename else None, 'raw_url': f'/download/{raw_filename}' if raw_filename else None, 'vision_url': f'/download/{vision_filename}' if vision_filename else None})}\n\n"
             else:
                 yield f"data: {json.dumps({'error': 'Extraction failed to produce data'})}\n\n"
             
